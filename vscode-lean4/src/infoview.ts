@@ -10,6 +10,7 @@ import { LeanClient } from './leanclient';
 import { getInfoViewAllErrorsOnLine, getInfoViewAutoOpen, getInfoViewAutoOpenShowGoal,
     getInfoViewFilterIndex, getInfoViewStyle, getInfoViewTacticStateFilters } from './config';
 import { Rpc } from './rpc';
+import { LeanClientProvider } from './utils/clientProvider'
 import * as ls from 'vscode-languageserver-protocol'
 
 const keepAlivePeriodMs = 10000
@@ -22,21 +23,23 @@ async function rpcConnect(client: LeanClient, uri: ls.DocumentUri): Promise<stri
 
 class RpcSession implements Disposable {
     keepAliveInterval?: NodeJS.Timeout;
+    client : LeanClient;
 
     constructor(client: LeanClient, public sessionId: string, public uri: ls.DocumentUri) {
+        this.client = client;
         this.keepAliveInterval = setInterval(() => {
             const params: RpcKeepAliveParams = { uri, sessionId }
             try {
                 client.sendNotification('$/lean/rpc/keepAlive', params)
             } catch (e) {
                 console.log(`failed to send keepalive for ${uri}`, e)
-                clearInterval(this.keepAliveInterval)
+                if (this.keepAliveInterval) clearInterval(this.keepAliveInterval)
             }
         }, keepAlivePeriodMs)
     }
 
     dispose() {
-        clearInterval(this.keepAliveInterval)
+        if (this.keepAliveInterval) clearInterval(this.keepAliveInterval)
         // TODO: at this point we could close the session
     }
 }
@@ -45,22 +48,60 @@ export class InfoProvider implements Disposable {
     /** Instance of the panel, if it is open. Otherwise `undefined`. */
     private webviewPanel?: WebviewPanel & {rpc: Rpc, api: InfoviewApi};
     private subscriptions: Disposable[] = [];
+    private clientSubscriptions: Disposable[] = [];
 
     private stylesheet: string = '';
     private autoOpened: boolean = false;
+    private clientProvider: LeanClientProvider;
 
     // Subscriptions are counted and only disposed of when count becomes 0.
-    private serverNotifSubscriptions: Map<string, [number, Disposable]> = new Map();
-    private clientNotifSubscriptions: Map<string, [number, Disposable]> = new Map();
+    private serverNotifSubscriptions: Map<string, [number, Disposable[]]> = new Map();
+    private clientNotifSubscriptions: Map<string, [number, Disposable[]]> = new Map();
 
     private rpcSessions: Map<string, RpcSession> = new Map();
 
+    private subscribeDidChangeNotification(client: LeanClient, method: string){
+        const h = client.didChange((params) => {
+            void this.webviewPanel?.api.sentClientNotification(method, params);
+        });
+        return h;
+    }
+
+    private subscribeDidCloseNotification(client: LeanClient, method: string){
+        const h = client.didClose((params) => {
+            void this.webviewPanel?.api.sentClientNotification(method, params);
+        });
+        return h;
+    }
+
+    private subscribeDiagnosticsNotification(client: LeanClient, method: string){
+        const h = client.diagnostics((params) => {
+            void this.webviewPanel?.api.gotServerNotification(method, params);
+        });
+        return h;
+    }
+
+    private subscribeCustomNotification(client: LeanClient, method: string){
+        const h = client.customNotification(({method: thisMethod, params}) => {
+            if (thisMethod !== method) return;
+            void this.webviewPanel?.api.gotServerNotification(method, params);
+        });
+        return h;
+    }
+
     private editorApi : EditorApi = {
-        sendClientRequest: async (method: string, params: any): Promise<any> => {
-            return this.client.sendRequest(method, params);
+        sendClientRequest: async (uri: string, method: string, params: any): Promise<any> => {
+            const client = this.clientProvider.findClient(uri);
+            if (client) {
+                return client.sendRequest(method, params);
+            }
+            return undefined;
         },
-        sendClientNotification: async (method: string, params: any): Promise<void> => {
-           return this.client.sendNotification(method, params);
+        sendClientNotification: async (uri: string, method: string, params: any): Promise<void> => {
+            const client = this.clientProvider.findClient(uri);
+            if (client) {
+                client.sendNotification(method, params);
+            }
         },
         subscribeServerNotifications: async (method) => {
             const el = this.serverNotifSubscriptions.get(method);
@@ -74,16 +115,17 @@ export class InfoProvider implements Disposable {
             // here because that *overwrites* the notification handler rather than registers an extra one.
             // So we have to add a bunch of event emitters to `LeanClient.`
             if (method === 'textDocument/publishDiagnostics') {
-                const h = this.client.diagnostics((params) => {
-                    void this.webviewPanel?.api.gotServerNotification(method, params);
-                });
-                this.serverNotifSubscriptions.set(method, [1, h]);
+                const subscriptions : Disposable[] = [];
+                for (const client of this.clientProvider.getClients()) {
+                    subscriptions.push(this.subscribeDiagnosticsNotification(client, method));
+                }
+                this.serverNotifSubscriptions.set(method, [1, subscriptions]);
             } else if (method.startsWith('$')) {
-                const h = this.client.customNotification(({method: thisMethod, params}) => {
-                    if (thisMethod !== method) return;
-                    void this.webviewPanel?.api.gotServerNotification(method, params);
-                });
-                this.serverNotifSubscriptions.set(method, [1, h]);
+                const subscriptions : Disposable[] = [];
+                for (const client of this.clientProvider.getClients()) {
+                    subscriptions.push(this.subscribeCustomNotification(client, method));
+                }
+                this.serverNotifSubscriptions.set(method, [1, subscriptions]);
             } else {
                 throw new Error(`subscription to ${method} server notifications not implemented`);
             }
@@ -91,14 +133,17 @@ export class InfoProvider implements Disposable {
         unsubscribeServerNotifications: async (method) => {
             const el = this.serverNotifSubscriptions.get(method);
             if (!el) throw new Error(`trying to unsubscribe from '${method}' with no active subscriptions`);
-            const [count, h] = el;
+            const [count, subscriptions] = el;
             if (count === 1) {
-                h.dispose();
+                for (const h of subscriptions){
+                    h.dispose();
+                }
                 this.serverNotifSubscriptions.delete(method);
             } else {
-                this.serverNotifSubscriptions.set(method, [count - 1, h])
+                this.serverNotifSubscriptions.set(method, [count - 1, subscriptions])
             }
         },
+
         subscribeClientNotifications: async (method) => {
             const el = this.clientNotifSubscriptions.get(method);
             if (el) {
@@ -108,28 +153,33 @@ export class InfoProvider implements Disposable {
             }
 
             if (method === 'textDocument/didChange') {
-                const h = this.client.didChange((params) => {
-                    void this.webviewPanel?.api.sentClientNotification(method, params);
-                });
-                this.clientNotifSubscriptions.set(method, [1, h]);
+                const subscriptions : Disposable[] = [];
+                for (const client of this.clientProvider.getClients()) {
+                    subscriptions.push(this.subscribeDidChangeNotification(client, method));
+                }
+                this.clientNotifSubscriptions.set(method, [1, subscriptions]);
             } else if (method === 'textDocument/didClose') {
-                const h = this.client.didClose((params) => {
-                    void this.webviewPanel?.api.sentClientNotification(method, params);
-                });
-                this.clientNotifSubscriptions.set(method, [1, h]);
+                const subscriptions : Disposable[] = [];
+                for (const client of this.clientProvider.getClients()) {
+                    subscriptions.push(this.subscribeDidCloseNotification(client, method))
+                }
+                this.clientNotifSubscriptions.set(method, [1,subscriptions]);
             } else {
                 throw new Error(`Subscription to '${method}' client notifications not implemented`);
             }
         },
+
         unsubscribeClientNotifications: async (method) => {
             const el = this.clientNotifSubscriptions.get(method);
             if (!el) throw new Error(`trying to unsubscribe from '${method}' with no active subscriptions`);
-            const [count, h] = el;
+            const [count, subscriptions] = el;
             if (count === 1) {
-                h.dispose();
+                for (const d of subscriptions) {
+                    d.dispose();
+                }
                 this.clientNotifSubscriptions.delete(method);
             } else {
-                this.clientNotifSubscriptions.set(method, [count - 1, h])
+                this.clientNotifSubscriptions.set(method, [count - 1, subscriptions])
             }
         },
         copyToClipboard: async (text) => {
@@ -137,26 +187,28 @@ export class InfoProvider implements Disposable {
             await window.showInformationMessage(`Copied to clipboard: ${text}`);
         },
         insertText: async (text, kind, tdpp) => {
-            if (!this.client.running) return;
-            let uri: Uri | undefined
-            let pos: Position | undefined
             if (tdpp) {
-                uri = this.client.convertUriFromString(tdpp.textDocument.uri);
-                pos = this.client.convertPosition(tdpp.position);
+                const client = this.clientProvider.findClient(tdpp.textDocument.uri);
+                if (!client?.running) return;
+                const uri = client.convertUriFromString(tdpp.textDocument.uri);
+                const pos = client.convertPosition(tdpp.position);
+                await this.handleInsertText(text, kind, uri, pos);
             }
-            await this.handleInsertText(text, kind, uri, pos);
         },
         showDocument: async (show) => {
-            if (!this.client.running) return;
+            const client = this.clientProvider.findClient(show.uri);
+            if (!client?.running) return;
             void this.revealEditorSelection(
                 Uri.parse(show.uri),
-                this.client.convertRange(show.selection)
+                client.convertRange(show.selection)
             );
         },
 
         createRpcSession: async uri => {
-            const sessionId = await rpcConnect(this.client, uri);
-            const session = new RpcSession(this.client, sessionId, uri);
+            const client = this.clientProvider.findClient(uri);
+            if (!client) return '';
+            const sessionId = await rpcConnect(client, uri);
+            const session = new RpcSession(client, sessionId, uri);
             if (!this.webviewPanel) {
                 session.dispose();
                 throw Error('infoview disconnect while connecting to RPC session');
@@ -174,25 +226,21 @@ export class InfoProvider implements Disposable {
         },
     };
 
-    constructor(private client: LeanClient, private readonly leanDocs: DocumentSelector, private context: ExtensionContext) {
+    constructor(private provider: LeanClientProvider, private readonly leanDocs: DocumentSelector, private context: ExtensionContext) {
+        this.clientProvider = provider;
         this.updateStylesheet();
+
+        provider.clientAdded((client) => {
+            void this.onClientAdded(client);
+        });
+
+        provider.clientRemoved((client) => {
+            void this.onClientRemoved(client);
+        });
+
         this.subscriptions.push(
-            this.client.restarted(async () => {
-                // This event is triggered both the first time the server starts
-                // as well as when the server restarts.
-
-                this.clearRpcSessions();
-
-                // The info view should auto-open the first time the server starts:
-                await this.autoOpen()
-
-                // Inform the infoview about the restart
-                // (this is redundant if the infoview was auto-opened but it doesn't hurt)
-                await this.webviewPanel?.api?.serverRestarted(this.client?.initializeResult);
-            }),
             window.onDidChangeActiveTextEditor(() => this.sendPosition()),
             window.onDidChangeTextEditorSelection(() => this.sendPosition()),
-            client.didSetLanguage(() => this.onLanguageChanged()),
             workspace.onDidChangeConfiguration(async (_e) => {
                 // regression; changing the style needs a reload. :/
                 this.updateStylesheet();
@@ -213,20 +261,82 @@ export class InfoProvider implements Disposable {
             commands.registerTextEditorCommand('lean4.infoView.toggleStickyPosition',
                 () => this.webviewPanel?.api.requestedAction({kind: 'togglePin'})),
         );
-        if (this.client.isStarted()) {
+    }
+
+    private async onClientRestarted(client: LeanClient){
+
+        if (client.isStarted()) {
             void this.autoOpen();
         }
+
+        // Inform the infoview about the restart
+        // (this is redundant if the infoview was auto-opened but it doesn't hurt)
+        if (client.initializeResult) {
+            await this.webviewPanel?.api.serverRestarted(client.initializeResult);
+        }
+
+        // if we already have subscriptions for a previous client, we need to also
+        // subscribe to the same things on this new client.
+        for (const [method, [count, subscriptions]] of this.clientNotifSubscriptions) {
+            if (method === 'textDocument/didChange'){
+                subscriptions.push(this.subscribeDidChangeNotification(client, method))
+            } else if (method === 'textDocument/didClose'){
+                subscriptions.push(this.subscribeDidCloseNotification(client, method))
+            }
+        }
+
+        for (const [method, [count, subscriptions]] of this.serverNotifSubscriptions) {
+            if (method === 'textDocument/publishDiagnostics'){
+                subscriptions.push(this.subscribeDiagnosticsNotification(client, method))
+            } else if (method.startsWith('$')){
+                subscriptions.push(this.subscribeCustomNotification(client, method))
+            }
+        }
+
+        // force infoview to fully update state from newly activated LeanClient.
+        await this.sendPosition();
+        await this.sendConfig();
+        await this.sendDiagnostics(client);
+        await this.sendProgress(client);
+    }
+
+    private async onClientAdded(client: LeanClient) {
+
+        console.log(`Adding client for workspace: ${client.getWorkspaceFolder()}`);
+
+        this.clientSubscriptions.push(
+            client.restarted(async () => {
+                // This event is triggered both the first time the server starts
+                // as well as when the server restarts.
+
+                this.clearRpcSessions(client);
+
+                // Need to fully re-initialize this newly restarted client with all the
+                // existing subscriptions and resend position info and so on so the
+                // infoview updates properly.
+                await this.onClientRestarted(client);
+            }),
+            client.didSetLanguage(() => this.onLanguageChanged()),
+        );
+
+        // Note that when new client is first created it still fires client.restarted
+        // event, so all onClientRestarted can happen there so we don't do it twice.
+    }
+
+    onClientRemoved(client: LeanClient) {
+        // todo: remove subscriptions for this client...
     }
 
     dispose(): void {
+        // active client is changing.
         this.clearNotificationHandlers();
-        this.clearRpcSessions();
+        this.clearRpcSessions(null);
+        for (const s of this.clientSubscriptions) { s.dispose(); }
         for (const s of this.subscriptions) { s.dispose(); }
     }
 
     private updateStylesheet() {
-        const fontFamily =
-            workspace.getConfiguration('editor').get<string>('fontFamily').replace(/['"]/g, '');
+        const fontFamily = workspace.getConfiguration('editor').get<string>('fontFamily')?.replace(/['"]/g, '');
         const fontCodeCSS = `
             .font-code {
                 font-family: ${fontFamily};
@@ -249,19 +359,28 @@ export class InfoProvider implements Disposable {
     }
 
     private clearNotificationHandlers() {
-        for (const [, [, h]] of this.clientNotifSubscriptions) h.dispose();
+        for (const [, [, subscriptions]] of this.clientNotifSubscriptions)
+            for (const h of subscriptions) h.dispose();
         this.clientNotifSubscriptions.clear();
-        for (const [, [, h]] of this.serverNotifSubscriptions) h.dispose();
+        for (const [, [, subscriptions]] of this.serverNotifSubscriptions)
+            for (const h of subscriptions) h.dispose();
         this.serverNotifSubscriptions.clear();
     }
 
-    private clearRpcSessions() {
-        for (const [_, sess] of this.rpcSessions) sess.dispose();
-        this.rpcSessions = new Map()
+    private clearRpcSessions(client: LeanClient | null) {
+        const remaining = new Map()
+        for (const [sessionId, sess] of this.rpcSessions) {
+            if (client === null || sess.client === client) {
+                sess.dispose();
+            } else {
+                remaining.set(sessionId, sess);
+            }
+        }
+        this.rpcSessions = remaining
     }
 
     private async openPreview(editor: TextEditor) {
-        let column = editor ? editor.viewColumn + 1 : ViewColumn.Two;
+        let column = editor && editor.viewColumn ? editor.viewColumn + 1 : ViewColumn.Two;
         if (column === 4) { column = ViewColumn.Three; }
         if (this.webviewPanel) {
             this.webviewPanel.reveal(column, true);
@@ -289,23 +408,28 @@ export class InfoProvider implements Disposable {
             webviewPanel.onDidDispose(() => {
                 this.clearNotificationHandlers();
                 this.webviewPanel = undefined;
-                this.clearRpcSessions(); // should be after `webviewPanel = undefined`
+                this.clearRpcSessions(null); // should be after `webviewPanel = undefined`
             });
             this.webviewPanel = webviewPanel;
             webviewPanel.webview.html = this.initialHtml();
 
-            await webviewPanel.api.initialize(this.getLocation(editor))
+            const loc = this.getLocation(editor);
+            if (loc) {
+                await webviewPanel.api.initialize(loc);
+            }
 
             // The infoview gets information about file progress, diagnostics, etc.
             // by listening to notifications.  Send these notifications when the infoview starts
             // so that it has up-to-date information.
-            if (this.client.initializeResult) {
-                await this.webviewPanel.api.serverRestarted(this.client.initializeResult);
+            const client = this.clientProvider.findClient(editor.document?.uri?.toString());
+            if (client?.initializeResult) {
+                await this.webviewPanel.api.serverRestarted(client?.initializeResult);
             }
-            await this.sendPosition();
-            await this.sendConfig();
-            await this.sendDiagnostics();
-            await this.sendProgress();
+
+            // await this.sendPosition();
+            // await this.sendConfig();
+            // await this.sendDiagnostics();
+            // await this.sendProgress();
         }
     }
 
@@ -318,20 +442,22 @@ export class InfoProvider implements Disposable {
        });
     }
 
-    private async sendDiagnostics() {
-        if (!this.webviewPanel) return;
-        this.client.getDiagnostics()?.forEach(async (uri, diags) => {
-            const params = this.client.getDiagnosticParams(uri, diags)
-            await this.webviewPanel.api.gotServerNotification('textDocument/publishDiagnostics', params);
-        });
+    private async sendDiagnostics(client: LeanClient) {
+        const panel = this.webviewPanel;
+        if (panel) {
+            client.getDiagnostics()?.forEach(async (uri, diags) => {
+                const params = client.getDiagnosticParams(uri, diags)
+                await panel.api.gotServerNotification('textDocument/publishDiagnostics', params);
+            });
+        }
     }
 
-    private async sendProgress() {
+    private async sendProgress(client: LeanClient) {
         if (!this.webviewPanel) return;
-        for (const [uri, processing] of this.client.progress) {
+        for (const [uri, processing] of client.progress) {
             const params: LeanFileProgressParams = {
                 textDocument: {
-                    uri: this.client.convertUri(uri)?.toString(),
+                    uri: client.convertUri(uri)?.toString(),
                     version: 0, // HACK: The infoview ignores this
                 },
                 processing,
@@ -342,12 +468,13 @@ export class InfoProvider implements Disposable {
 
     private onLanguageChanged() {
         void this.autoOpen();
+        void this.sendPosition();
     }
 
     private getLocation(editor : TextEditor) : ls.Location | undefined {
         if (!editor) return undefined;
-        const uri = window.activeTextEditor.document.uri;
-        const selection = window.activeTextEditor.selection;
+        const uri = editor.document.uri;
+        const selection = editor.selection;
         return {
             uri: uri.toString(),
             range: {
@@ -358,14 +485,20 @@ export class InfoProvider implements Disposable {
     }
 
     private async sendPosition() {
-        if (!window.activeTextEditor || languages.match(this.leanDocs, window.activeTextEditor.document) === 0) return
-        await this.autoOpen();
+        if (!window.activeTextEditor) return
         const loc = this.getLocation(window.activeTextEditor);
+        if (languages.match(this.leanDocs, window.activeTextEditor.document) === 0){
+            // language is not yet 'lean4', but the LeanClient will fire the didSetLanguage event
+            // in openLean4Document and that's when we can send the position to update the
+            // InfoView for the newly opened document.
+            return;
+        }
+        await this.autoOpen();
         await this.webviewPanel?.api.changedCursorLocation(loc);
     }
 
     private async revealEditorSelection(uri: Uri, selection?: Range) {
-        let editor: TextEditor = null;
+        let editor: TextEditor | undefined;
         for (const e of window.visibleTextEditors) {
             if (e.document.uri.toString() === uri.toString()) {
                 editor = e;
@@ -379,6 +512,8 @@ export class InfoProvider implements Disposable {
         if (selection !== undefined) {
             editor.revealRange(selection, TextEditorRevealType.InCenterIfOutsideViewport);
             editor.selection = new Selection(selection.start, selection.end);
+            // ensure the text document has the keyboard focus.
+            void window.showTextDocument(editor.document, { viewColumn: editor.viewColumn, preserveFocus: false });
         }
     }
 
@@ -415,15 +550,18 @@ export class InfoProvider implements Disposable {
             editor.selection = new Selection(pos.line, spaces, pos.line, spaces);
         } else {
             await editor.edit((builder) => {
-                builder.insert(pos, text);
+                if (pos) builder.insert(pos, text);
             });
             editor.selection = new Selection(pos, pos)
         }
     }
 
-    private getMediaPath(mediaFile: string): string {
-        return this.webviewPanel?.webview.asWebviewUri(
-            Uri.file(join(this.context.extensionPath, 'media', mediaFile))).toString();
+    private getMediaPath(mediaFile: string): string | undefined {
+        if (this.webviewPanel) {
+            return this.webviewPanel.webview.asWebviewUri(
+                Uri.file(join(this.context.extensionPath, 'media', mediaFile))).toString();
+        }
+        return undefined;
     }
 
     private initialHtml() {

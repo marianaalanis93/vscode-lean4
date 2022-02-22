@@ -1,13 +1,40 @@
-import { workspace, commands, window, languages, ExtensionContext, TextEditor, Range } from 'vscode'
+import { window, Uri, workspace, ExtensionContext, TextDocument } from 'vscode'
 import { AbbreviationFeature } from './abbreviation'
-import { LeanClient } from './leanclient'
 import { InfoProvider } from './infoview'
 import { DocViewProvider } from './docview';
 import { LeanTaskGutter } from './taskgutter'
 import { LocalStorageService} from './utils/localStorage'
 import { LeanInstaller } from './utils/leanInstaller'
 import { LeanpkgService } from './utils/leanpkg';
+import { LeanClientProvider } from './utils/clientProvider';
 import { addDefaultElanPath } from './config';
+import { dirname, basename } from 'path';
+import { findLeanPackageVersionInfo } from './utils/projectInfo';
+
+function isLean(languageId : string) : boolean {
+    return languageId === 'lean' || languageId === 'lean4';
+}
+
+
+function getLeanDocument() : TextDocument | undefined {
+    let document : TextDocument | undefined;
+    if (window.activeTextEditor && isLean(window.activeTextEditor.document.languageId))
+    {
+        document = window.activeTextEditor.document
+    }
+    else {
+        // This happens if vscode starts with a lean file open
+        // but the "Getting Started" page is active.
+        for (const editor of window.visibleTextEditors) {
+            const lang = editor.document.languageId;
+            if (isLean(lang)) {
+                document = editor.document;
+                break;
+            }
+        }
+    }
+    return document;
+}
 
 export async function activate(context: ExtensionContext): Promise<any> {
 
@@ -16,66 +43,65 @@ export async function activate(context: ExtensionContext): Promise<any> {
     const defaultToolchain = 'leanprover/lean4:nightly';
     const outputChannel = window.createOutputChannel('Lean: Editor');
     const storageManager = new LocalStorageService(context.workspaceState);
-    const pkgService = new LeanpkgService(storageManager, defaultToolchain)
-    context.subscriptions.push(pkgService);
 
-    const installer = new LeanInstaller(outputChannel, storageManager, pkgService, defaultToolchain)
+    // migrate to new setting where it is now a directory location, not the
+    // actual full file name of the lean program.
+    const path = storageManager.getLeanPath();
+    if (path) {
+        const filename = basename(path);
+        if (filename === 'lean' || filename === 'lean.exe') {
+            const newPath = dirname(dirname(path)); // above the 'bin' folder.
+            storageManager.setLeanPath(newPath === '.' ? '' : newPath);
+        }
+    }
+
+    // note: workspace.rootPath can be undefined in the untitled or adhoc case
+    // where the user ran "code lean_filename".
+    const doc = getLeanDocument();
+    let packageUri = null;
+    let toolchainVersion = null;
+    if (doc) {
+        [packageUri, toolchainVersion] = await findLeanPackageVersionInfo(doc.uri);
+        if (toolchainVersion && toolchainVersion.indexOf('lean:3') > 0) {
+            // then this file belongs to a lean 3 project!
+            return { isLean4Project: false };
+        }
+    }
+
+    const installer = new LeanInstaller(outputChannel, storageManager, defaultToolchain)
     context.subscriptions.push(installer);
 
-    const versionInfo = await installer.testLeanVersion();
-    if (versionInfo.version && versionInfo.version !== '4') {
-        // ah, then don't activate this extension!
-        // this gives us side by side compatibility with the Lean 3 extension.
+    const pkgService = new LeanpkgService()
+    context.subscriptions.push(pkgService);
+
+    const versionInfo = await installer.checkLeanVersion(packageUri, toolchainVersion??defaultToolchain)
+    // Check whether rootPath is a Lean 3 project (the Lean 3 extension also uses the deprecated rootPath)
+    if (versionInfo.version === '3') {
+        context.subscriptions.pop()?.dispose(); // stop installer
+        // We need to terminate before registering the LeanClientProvider,
+        // because that class changes the document id to `lean4`.
         return { isLean4Project: false };
     }
 
-    await Promise.all(workspace.textDocuments.map(async (doc) =>
-        doc.languageId === 'lean' && languages.setTextDocumentLanguage(doc, 'lean4')))
+    const clientProvider = new LeanClientProvider(storageManager, installer, pkgService, outputChannel);
+    context.subscriptions.push(clientProvider)
 
-    const client: LeanClient = new LeanClient(storageManager, outputChannel)
-    context.subscriptions.push(client)
-
-    // Register support for unicode input
-    const info = new InfoProvider(client, {language: 'lean4'}, context);
+    const info = new InfoProvider(clientProvider, {language: 'lean4'}, context);
     context.subscriptions.push(info)
 
     const abbrev = new AbbreviationFeature();
     context.subscriptions.push(abbrev);
 
-    const docview = new DocViewProvider();
+    const docview = new DocViewProvider(context.extensionUri);
     context.subscriptions.push(docview);
 
     // pass the abbreviations through to the docview so it can show them on demand.
     docview.setAbbreviations(abbrev.abbreviations.symbolsByAbbreviation);
 
-    context.subscriptions.push(new LeanTaskGutter(client, context))
+    context.subscriptions.push(new LeanTaskGutter(clientProvider, context))
 
-    context.subscriptions.push(commands.registerCommand('lean4.refreshFileDependencies', () => {
-        if (!window.activeTextEditor) { return }
-        client.refreshFileDependencies(window.activeTextEditor)
-    }))
-    context.subscriptions.push(commands.registerCommand('lean4.restartServer', () => client.restart()));
+    pkgService.versionChanged((uri) => installer.handleVersionChanged(uri));
+    pkgService.lakeFileChanged((uri) => installer.handleLakeFileChanged(uri));
 
-    let busy = false
-    installer.installChanged(async () => {
-        if (busy) return;
-        busy = true; // avoid re-entrancy since testLeanVersion can take a while.
-        try {
-            // have to check again here in case elan install had --default-toolchain none.
-            const version = await installer.testLeanVersion();
-            if (version.version === '4') {
-                void client.restart()
-            }
-        } catch {
-        }
-        busy = false;
-    });
-
-    pkgService.versionChanged((v) => installer.handleVersionChanged(v));
-    client.serverFailed((err) => window.showErrorMessage(err));
-
-    if (versionInfo.version === '4' && !versionInfo.error) {
-        void client.start();
-    }
     return  { isLean4Project: true };
 }

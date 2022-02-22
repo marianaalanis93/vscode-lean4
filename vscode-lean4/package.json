@@ -1,14 +1,17 @@
 {
 	"name": "lean4",
 	"displayName": "lean4",
-	"description": "An extension for VS Code which provides support for the Lean 4 language.",
-	"version": "0.0.56",
+	"description": "Lean 4 language support for VS Code",
+	"version": "0.0.68",
 	"publisher": "leanprover",
 	"engines": {
 		"vscode": "^1.57.0"
 	},
 	"categories": [
 		"Programming Languages"
+	],
+	"keywords": [
+		"multi-root ready"
 	],
 	"repository": {
 		"type": "git",
@@ -19,10 +22,11 @@
 			"type": "object",
 			"title": "Lean 4",
 			"properties": {
-				"lean4.executablePath": {
+				"lean4.toolchainPath": {
 					"type": "string",
-					"default": "lean",
-					"markdownDescription": "Path to the Lean executable to use. **DO NOT CHANGE** from the default `lean` unless you know what you're doing!"
+					"default": "",
+					"markdownDescription": "Path to your Lean toolchain. Leave this blank to get the default location from your PATH environment or from the default elan install location.",
+					"scope": "machine-overridable"
 				},
 				"lean4.input.enabled": {
 					"type": "boolean",
@@ -67,7 +71,8 @@
 					"additionalProperties": {
 						"type": "string",
 						"description": "environment variable to add"
-					}
+					},
+					"scope": "machine-overridable"
 				},
 				"lean4.serverEnvPaths": {
 					"type": "array",
@@ -76,7 +81,13 @@
 					"items": {
 						"type": "string",
 						"description": "a path to add to the environment"
-					}
+					},
+					"scope": "machine-overridable"
+				},
+				"lean4.enableLake": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Enable Lake server when possible."
 				},
 				"lean4.serverArgs": {
 					"type": "array",
@@ -95,7 +106,8 @@
 				"lean4.serverLogging.path": {
 					"type": "string",
 					"default": ".",
-					"description": "Path to the directory where Lean 4 server log files are stored."
+					"description": "Path to the directory where Lean 4 server log files are stored.",
+					"scope": "machine-overridable"
 				},
 				"lean4.infoViewAllErrorsOnLine": {
 					"type": "boolean",
@@ -407,7 +419,8 @@
 		"axios": "^0.24.0",
 		"cheerio": "^1.0.0-rc.10",
 		"mobx": "5.15.7",
-		"vscode-languageclient": "=7.0.0"
+		"vscode-languageclient": "=7.0.0",
+		"semver": "=7.3.5"
 	},
 	"devDependencies": {
 		"@types/node": "^17.0.7",
@@ -419,7 +432,8 @@
 		"typescript": "^4.5.4",
 		"vsce": "~2.6.2",
 		"webpack": "^5.65.0",
-		"webpack-cli": "^4.9.1"
+		"webpack-cli": "^4.9.1",
+		"@types/semver": "^5.3.30"
 	},
 	"icon": "images/lean_logo.png",
 	"license": "Apache-2.0"
